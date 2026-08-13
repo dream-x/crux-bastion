@@ -1,0 +1,181 @@
+#!/bin/sh
+# lab-host — the host layer of the bastion: it lives on the container host and calls
+# `lab` inside the container.
+#
+# The layer is kept deliberately and holds exactly the knowledge that exists only on the
+# host: whether the docker daemon (Colima) is alive, what the container is called, and
+# whether the caller has a TTY. It does not parse the command grammar — the arguments go
+# into `lab` as they are, so that the list of subcommands does not have to be kept in two
+# places.
+#
+# Executed by zsh/sh on macOS, but written as POSIX sh and linted with `shellcheck -s sh` —
+# the same dialect as `lab`, so as not to keep two sets of rules in one's head.
+#
+# Exit codes: 0 and whatever `lab` returned (2 — bad arguments, 1 — a tmux error);
+# 3 — the container is not running or does not exist; 4 — docker is unavailable (the daemon
+# is down — usually that means Colima — or the CLI itself is not on PATH).
+#
+# Codes 3 and 4 are not reserved: `lab run` hands the process over to the agent and returns
+# its code as it is, so 3 and 4 may also arrive from the agent. They can be told apart by
+# stderr — lab-host announces its own trouble with a "lab-host: …" line, and lab with a
+# "lab: …" line; an agent's code arrives silently.
+#
+# LAB_CONTAINER — the container name (claude by default).
+# LAB_DRY_RUN=1 — print the command instead of running it; the container state is checked
+# all the same, otherwise a dry run would stay silent about a Colima that is down.
+
+set -eu
+
+# Name of the container holding tmux and the agents. The default is only a
+# plausible example — set LAB_CONTAINER in the host's environment (~/.zshenv,
+# which is what a non-interactive ssh reads) to match your own stack.
+LAB_CONTAINER=${LAB_CONTAINER:-agents}
+
+usage() {
+	cat <<'EOF'
+lab-host — run lab inside the claude container on the container host
+
+usage:
+  lab-host [args...]       pass args to lab in the container
+  lab-host -- <args...>    same, but nothing is intercepted (lab-host -- --help)
+  lab-host --help          this help
+
+lab-host does not parse the lab grammar, see `lab-host -- --help` for it.
+
+environment: LAB_CONTAINER picks the container (default: claude)
+exit codes: 0 and whatever lab returned, 3 container not running,
+            4 docker unavailable (daemon down or no docker in PATH);
+            lab run is transparent, so 3 and 4 from it may be the agent's own codes —
+            a bastion failure always comes with a "lab-host: " or "lab: " line on stderr
+EOF
+}
+
+die() {
+	printf 'lab-host: %s\n' "$1" >&2
+	exit "${2:-1}"
+}
+
+# a string rendering of the command for LAB_DRY_RUN; an argument with spaces in it is
+# wrapped in single quotes, otherwise `run pi "2 + 2"` cannot be told from `run pi 2 + 2`
+# in the output.
+# A copy of the function of the same name from `lab`: the scripts live on different
+# machines and cannot have a shared library.
+lh_cmdline() {
+	lh_line=
+	for lh_arg in "$@"; do
+		case $lh_arg in
+		*[[:space:]]*) lh_arg="'$lh_arg'" ;;
+		esac
+		if [ -z "$lh_line" ]; then
+			lh_line=$lh_arg
+		else
+			lh_line="$lh_line $lh_arg"
+		fi
+	done
+	printf '%s\n' "$lh_line"
+}
+
+lh_exec() {
+	if [ -n "${LAB_DRY_RUN:-}" ]; then
+		lh_cmdline "$@"
+		exit 0
+	fi
+	exec "$@"
+}
+
+# The container state in a single call: `docker inspect` tells all four cases apart, while
+# `docker info` + `docker inspect` would cost an extra round trip to the daemon for the
+# same answer. "The daemon is down" and "there is no container" differ only in the text of
+# the error — docker returns exit code 1 for both, so the parsing goes by substring.
+#
+# The difference matters in practice: when there is no daemon, the cure is `colima start`,
+# not fiddling with the container. (A launchd agent that starts Colima at login, with
+# RunAtLoad, makes Colima come up by itself after a reboot; on the host we tested there was
+# nothing to verify that on — the agent had been installed after the last boot. The hint is
+# correct either way: if there is no daemon, what helps by hand is exactly `colima start`.)
+#
+# The streams are kept apart: the state is read from stdout, the error text from stderr.
+# They cannot be merged into a single variable, because docker prints warnings (an outdated
+# config.json, a credential helper, a context) on a successful inspect as well — and then
+# "true" turns into "true\nWARNING: …", matches none of the branches, and the whole chain
+# dies on a live and perfectly healthy container.
+check_container() {
+	lh_err=$(mktemp) || die "cannot create a temp file" 1
+	if lh_out=$(docker inspect -f '{{.State.Running}}' "$LAB_CONTAINER" 2>"$lh_err"); then
+		rm -f "$lh_err"
+		case $lh_out in
+		true) return 0 ;;
+		false) die "container '$LAB_CONTAINER' is not running: docker start $LAB_CONTAINER" 3 ;;
+		esac
+		# inspect worked, but said some third thing — we are not going to invent a state
+		printf '%s\n' "$lh_out" >&2
+		die "cannot tell whether '$LAB_CONTAINER' is running" 1
+	fi
+	lh_out=$(cat "$lh_err")
+	rm -f "$lh_err"
+
+	# Docker changes the capitalisation and the wording from version to version: Docker 29
+	# says `error: no such object`, older builds say `Error: No such object`. Catching both
+	# capitalisations by listing patterns is a guarantee of missing one someday (which is
+	# exactly what happened: the `No such` branch did not fire at all on a live machine),
+	# so the comparison is done against the text lowercased.
+	lh_low=$(printf '%s' "$lh_out" | tr '[:upper:]' '[:lower:]')
+
+	case $lh_low in
+	*'cannot connect to the docker daemon'* | *'is the docker daemon running'* | \
+		*'error during connect'* | *'connection refused'* | *'dial unix'* | \
+		*'failed to connect to the docker api'*)
+		die "docker daemon is unreachable: colima start" 4
+		;;
+	# The "no such object" branch is obliged to come after the daemon branch: the message
+	# about a dead socket contains "no such file or directory", and a general `no such`
+	# pattern would have taken a Colima that is down for a missing container.
+	*'no such object'* | *'no such container'*)
+		die "no container named '$LAB_CONTAINER': docker ps -a" 3
+		;;
+	esac
+
+	# unfamiliar trouble: we hand back docker's raw message, it is more useful than our guess
+	printf '%s\n' "$lh_out" >&2
+	die "docker inspect failed for '$LAB_CONTAINER'"
+}
+
+case ${1:-} in
+--help | -h)
+	usage
+	exit 0
+	;;
+--)
+	shift
+	;;
+esac
+
+# the docker CLI may not be found if the PATH of a non-interactive ssh was assembled
+# without Homebrew; the shell's "command not found" message helps nobody here.
+#
+# The code is the same as for a daemon that is down: from the caller's point of view this
+# is one state — "docker is unavailable, the container cannot be reached". A separate fifth
+# code would add a line to the help and to four documents for the sake of a distinction
+# that is visible in the message itself.
+command -v docker >/dev/null 2>&1 || die "docker not found in PATH" 4
+
+check_container
+
+# When there is a TTY, -it is needed, otherwise docker will refuse to allocate a terminal;
+# in `ssh <host> 'lab-host ls'` and in pipes there is no TTY, and -i is enough there. Both
+# ends are checked: mosh/ssh can hand over one without the other.
+lh_tty=-i
+if [ -t 0 ] && [ -t 1 ]; then
+	lh_tty=-it
+fi
+
+# TERM is passed through explicitly: without it docker substitutes its own xterm and tmux
+# loses its colours. An empty TERM is not passed through at all — TERM= inside is worse
+# than the variable being absent.
+if [ -n "${TERM:-}" ]; then
+	set -- docker exec "$lh_tty" -e TERM="$TERM" "$LAB_CONTAINER" lab "$@"
+else
+	set -- docker exec "$lh_tty" "$LAB_CONTAINER" lab "$@"
+fi
+
+lh_exec "$@"

@@ -1,0 +1,8 @@
+# bats leaves these behind when a run is interrupted
+.bats-*/
+*.tmp
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/

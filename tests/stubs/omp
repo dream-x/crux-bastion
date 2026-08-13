@@ -1,0 +1,6 @@
+#!/bin/sh
+# Test stub for omp. The logic lives in _stub.sh, see the comment there.
+# shellcheck source=tests/stubs/_stub.sh
+. "$(dirname "$0")/_stub.sh"
+
+stub_main "omp" "$@"

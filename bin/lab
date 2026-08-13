@@ -1,0 +1,397 @@
+#!/bin/sh
+# lab — the single entry point to the agent tmux sessions inside the claude container.
+#
+# Executed by dash in a Debian container, so POSIX sh only: no arrays, no local,
+# no [[ ]]. Linted as `shellcheck -s sh`.
+#
+# The grammar is deliberately explicit: subcommands are spelled out as a list, and
+# arbitrary session names only ever arrive through `lab attach <name>`. Otherwise a
+# session named `ls` breaks the parsing, and the "bad arguments" exit code becomes
+# unreachable.
+#
+# Exit codes of lab itself: 0 — success, 1 — a tmux error (no such session, the server
+# complained), 2 — bad arguments. Host-side states (3 — there is no container, 4 — docker
+# is unavailable) are reported by lab-host, not by lab.
+#
+# `run` is the exception: it hands the process over to the agent via exec and returns
+# exactly the agent's own code, including 3 and 4 (which mean something else to the agent).
+# Transparency matters more here than non-overlapping codes: `run` replaced the older
+# per-agent one-shot wrappers and has to work in pipes and in scripts, and an agent's exit
+# code is only meaningful as a whole. The two can be told apart by stderr: trouble in the
+# bastion is always accompanied by a "lab: …" or "lab-host: …" line, an agent's code is not.
+#
+# LAB_DRY_RUN=1 — print the command instead of running it; for the tests and for debugging
+# on a live machine. What gets printed is the final command the script would have handed
+# to exec; the session-existence checks are skipped in that mode, while the session list
+# for the menu is still requested — without it the menu would have nothing to show.
+
+set -eu
+
+# the directory sessions are opened in: the bind-mount of the host's projects directory.
+# Overridable through the environment — that is needed by the tests and for debugging
+# outside the container, where /workspace does not exist.
+LAB_WORKDIR=${LAB_WORKDIR:-/workspace}
+
+# Extra launch flags for an agent that needs them. An agent named pi is the example wired
+# up here: it is pointed at a local Ollama endpoint, so its provider is fixed. The model,
+# by contrast, is not hardcoded — it comes from LAB_PI_MODEL (whose default value is set
+# in compose.yaml). Otherwise the model string would live in three places and drift apart.
+# omp gets no model at all: it has its own ~/.omp/agent/config.yml with modelRoles.
+LAB_PI_PROVIDER=ollama
+
+# Configuration: the agents that get a session preset and a one-shot mode. Overridable
+# from the environment. The list is a single one for everything: the parsing of
+# `lab <agent>`, the validation in `lab run <agent>`, the hint in the error message and
+# the help line all derive from it. There are no copies — the help is assembled from this
+# same variable, so adding an agent means editing this one line. Any agent that is on
+# PATH can be added; one that needs extra flags is handled in lab_with_agent (see pi).
+LAB_AGENTS=${LAB_AGENTS:-'claude codex omp'}
+
+# the line format of `lab ls`: the same as tmux's default, but without the creation date
+LAB_LS_FORMAT='#{session_name}: #{session_windows} windows#{?session_attached, (attached),}'
+
+# the line format for the menu: only the name, the menu shows nothing else
+LAB_MENU_FORMAT='#{session_name}'
+
+# The heredoc is deliberately unquoted: the only substitution in the text is the agent
+# list, and there are no `$` and no backticks in the help.
+usage() {
+	cat <<EOF
+lab — agent sessions inside the claude container
+
+usage:
+  lab                      list sessions, pick one by number; none yet -> create main
+  lab ls                   compact session list
+  lab attach <name>        attach or create a session in /workspace
+  lab $(lab_agents_pipe)        attach or create a session running that agent
+  lab run <agent> <text>   one-shot request, no tmux, output to stdout
+  lab kill <name>          kill a session
+  lab --help               this help
+
+session names: letters, digits, "_" and "-", never starting with "-"
+               (tmux forbids dots and would read a leading "-" as its own option)
+environment: LAB_PI_MODEL picks the model for pi; omp keeps its own config.yml
+             LAB_WORKDIR is where sessions open (default: /workspace)
+exit codes: 0 ok, 1 tmux error (no such session), 2 bad arguments
+            run is transparent: it execs the agent and returns the agent's own code
+EOF
+}
+
+# a parse error message plus a short hint, exit code 2
+die_usage() {
+	printf 'lab: %s\n' "$1" >&2
+	printf "try 'lab --help'\n" >&2
+	exit 2
+}
+
+# an error without the hint about --help: the mistake was not in the grammar but in a
+# session name or in a number from the menu — help on the commands is of no use there
+die() {
+	printf 'lab: %s\n' "$1" >&2
+	exit "${2:-1}"
+}
+
+# the agent list joined by commas — for messages only
+lab_agents_list() {
+	printf '%s' "$LAB_AGENTS" | sed 's/ /, /g'
+}
+
+# the same list joined by `|` — for the help line `lab claude|codex|omp`
+lab_agents_pipe() {
+	printf '%s' "$LAB_AGENTS" | tr ' ' '|'
+}
+
+# is this agent known? The comparison is element by element and uses `=`, that is, it is
+# literal: `lab run '*'` will not pass for a known agent, and a multi-word argument will
+# not pass for a pair of adjacent list elements. A substring search in " $LAB_AGENTS "
+# did not have that property: `omp pi` and `pi claude` are substrings too, and they passed
+# the check, after which `lab 'omp pi'` created a session with a space in its name, going
+# right past check_name, and `lab run 'pi claude'` failed with a raw "not found" and exit
+# code 127 instead of exit code 2.
+is_agent() {
+	for lab_known in $LAB_AGENTS; do
+		if [ "${1:-}" = "$lab_known" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# session name: [a-zA-Z0-9_-]+; the dot is forbidden by tmux itself, a space breaks the parsing
+check_name() {
+	case ${1:-} in
+	'') die_usage "empty session name" ;;
+	# tmux would read a name starting with a dash as one of its own options:
+	# `lab attach -A` would have created a session named `-A` instead of failing
+	-*) die_usage "bad session name: '$1' (must not start with -)" ;;
+	*[!a-zA-Z0-9_-]*) die_usage "bad session name: '$1' (allowed: letters, digits, _ and -)" ;;
+	esac
+}
+
+# the agent name for `lab run`: in the interactive presets it has already been checked by
+# the parsing, whereas `run <agent>` accepts an arbitrary word
+check_agent() {
+	is_agent "${1:-}" || die_usage "unknown agent: '${1:-}' (known: $(lab_agents_list))"
+}
+
+# a string rendering of the command: an argument with spaces in it is wrapped in single
+# quotes, otherwise `run pi "2 + 2"` cannot be told from `run pi 2 + 2` in the output
+lab_cmdline() {
+	lab_line=
+	for lab_arg in "$@"; do
+		case $lab_arg in
+		*[[:space:]]*) lab_arg="'$lab_arg'" ;;
+		esac
+		if [ -z "$lab_line" ]; then
+			lab_line=$lab_arg
+		else
+			lab_line="$lab_line $lab_arg"
+		fi
+	done
+	printf '%s\n' "$lab_line"
+}
+
+# run the command, handing the process over to it; under LAB_DRY_RUN — only print it
+lab_exec() {
+	if [ -n "${LAB_DRY_RUN:-}" ]; then
+		lab_cmdline "$@"
+		exit 0
+	fi
+	exec "$@"
+}
+
+# The session list in format $1 on stdout.
+# Codes: 0 — the list is not empty, 1 — there is no server (there are no sessions),
+#        2 — tmux complained about something else, its message has already gone to stderr.
+#
+# tmux reports "the server is not running" the same way it reports any other trouble: exit
+# code 1 and a line on stderr — so the only way to tell one from the other is by the text.
+# The streams are kept apart while doing it: merged into a single variable, a tmux warning
+# on a successful call would become an extra "session" in the list and an extra line in
+# the menu.
+lab_list() {
+	lab_err=$(mktemp) || return 2
+	if lab_out=$(tmux list-sessions -F "$1" 2>"$lab_err"); then
+		rm -f "$lab_err"
+		[ -n "$lab_out" ] || return 1
+		printf '%s\n' "$lab_out"
+		return 0
+	fi
+	lab_out=$(cat "$lab_err")
+	rm -f "$lab_err"
+
+	# the capitalisation in these messages is not ours: "No such file or directory" comes from strerror
+	lab_low=$(printf '%s' "$lab_out" | tr '[:upper:]' '[:lower:]')
+	case $lab_low in
+	*'no server running'* | *'no sessions'*) return 1 ;;
+	# tmux says "error connecting to …" both about a missing socket (there are no sessions)
+	# and about Permission denied / Connection refused on a live socket (that one is real
+	# trouble, and staying silent about it is not an option) — the only thing that tells
+	# them apart is the reason in the parentheses
+	*'error connecting to'*'no such file or directory'*) return 1 ;;
+	esac
+	printf '%s\n' "$lab_out" >&2
+	return 2
+}
+
+# attach-or-create without a name check: it is called with a name that came from tmux
+# itself (the menu) — there anything tmux allows is allowed, including spaces.
+# Everything after the name is the command tmux will run in the new session (the agent
+# preset); without it the session opens with a shell. This is the one and only tmux
+# invocation line in the whole script.
+lab_attach() {
+	lab_name=$1
+	shift
+	lab_exec tmux new -As "$lab_name" -c "$LAB_WORKDIR" "$@"
+}
+
+cmd_attach() {
+	check_name "${1:-}"
+	lab_attach "$1"
+}
+
+# The agent's launch arguments — a single point of truth for both the preset and the
+# one-shot mode: the function calls the command it was passed, appending the agent
+# invocation to it. The preset passes `lab_attach <session name>` in here, the one-shot
+# mode passes `lab_run_exec <text>`, a wrapper that will append `-p <text>` at the very
+# end. That way the launch line for pi (provider and model) exists in exactly one place.
+lab_with_agent() {
+	# the variable has a name of its own, not lab_agent: that one is held by cmd_run, and
+	# overwriting someone else's variable from a called function is exactly the sort of
+	# coupling that breaks silently
+	lab_kind=$1
+	shift
+	case $lab_kind in
+	pi)
+		# An agent that needs extra flags on its command line; pi is the example wired up
+		# here. The provider is always passed: pi is pointed at a local Ollama endpoint.
+		# The model — only when it is set, otherwise pi will take its own from
+		# ~/.pi/agent/models.json; the script has no business inventing one for it
+		if [ -n "${LAB_PI_MODEL:-}" ]; then
+			"$@" pi --provider "$LAB_PI_PROVIDER" --model "$LAB_PI_MODEL"
+		else
+			"$@" pi --provider "$LAB_PI_PROVIDER"
+		fi
+		;;
+	*)
+		"$@" "$lab_kind"
+		;;
+	esac
+}
+
+# The agent preset: the session name matches the agent name, and the agent is already
+# running inside it. The command is handed to tmux as separate arguments (tmux joins them
+# itself, escaping as needed) rather than as a single string through sh -c — that way
+# nothing in the model name can break anything.
+#
+# The agent is started directly, without a wrapper shell: when the agent exits, the session
+# closes. That is deliberate, `tmux new -As` will bring it right back on the next call.
+cmd_agent() {
+	lab_with_agent "$1" lab_attach "$1"
+}
+
+# The tail of the one-shot mode: the request is appended after the agent's arguments. The
+# text arrives as the first argument rather than through a global variable: lab_with_agent
+# appends its own part on the right, and on the left there is room for exactly one
+# "binding" — which is what the request takes.
+lab_run_exec() {
+	lab_prompt=$1
+	shift
+	lab_exec "$@" -p "$lab_prompt"
+}
+
+# A one-shot request: no tmux and no session — the agent is called directly and its output
+# goes to stdout, so that pipes and scripts work (this is the replacement for the older
+# per-agent one-shot wrappers).
+cmd_run() {
+	lab_agent=$1
+	shift
+	# all the remaining words are one single request: `run pi 2 + 2` and `run pi "2 + 2"`
+	# have to reach the agent identically ($* joins them with a space)
+	lab_text=$*
+
+	check_agent "$lab_agent"
+	[ -n "$lab_text" ] || die_usage "empty request"
+
+	# the tmux presets open the session in /workspace through -c, while the one-shot mode
+	# has to get there on its own: the image's WORKDIR is not /workspace
+	if [ -z "${LAB_DRY_RUN:-}" ]; then
+		cd "$LAB_WORKDIR" 2>/dev/null || die "cannot enter $LAB_WORKDIR"
+	fi
+
+	lab_with_agent "$lab_agent" lab_run_exec "$lab_text"
+}
+
+cmd_ls() {
+	lab_rc=0
+	lab_out=$(lab_list "$LAB_LS_FORMAT") || lab_rc=$?
+	case $lab_rc in
+	0) printf '%s\n' "$lab_out" ;;
+	1) printf 'lab: no sessions\n' >&2 ;;
+	*) exit 1 ;;
+	esac
+}
+
+cmd_kill() {
+	check_name "${1:-}"
+	# the `=` before the name means an exact match. Without it tmux resolves the target by
+	# prefix, and `lab kill wor` would have silently killed the session `work` with exit
+	# code 0; `tmux new -As`, on the contrary, is always exact, so without the `=` attach
+	# and kill would understand a name differently
+	if [ -z "${LAB_DRY_RUN:-}" ] && ! tmux has-session -t "=$1" 2>/dev/null; then
+		die "no such session: $1"
+	fi
+	lab_exec tmux kill-session -t "=$1"
+}
+
+# The menu with no arguments: a numbered list and a choice by number. The list itself and
+# the prompt go to stderr so that stdout stays clean (under LAB_DRY_RUN it holds only the
+# resulting command).
+cmd_menu() {
+	lab_rc=0
+	lab_names=$(lab_list "$LAB_MENU_FORMAT") || lab_rc=$?
+	if [ "$lab_rc" -gt 1 ]; then
+		exit 1
+	fi
+	if [ "$lab_rc" -eq 1 ]; then
+		printf 'lab: no sessions, starting main\n' >&2
+		cmd_attach main
+	fi
+
+	lab_i=0
+	while IFS= read -r lab_name; do
+		lab_i=$((lab_i + 1))
+		printf '%2d) %s\n' "$lab_i" "$lab_name" >&2
+	done <<EOF
+$lab_names
+EOF
+	printf 'pick a session number (empty to cancel): ' >&2
+
+	if ! IFS= read -r lab_pick; then
+		printf '\n' >&2
+		exit 0
+	fi
+	case $lab_pick in
+	'') exit 0 ;;
+	*[!0-9]*) die "not a session number: '$lab_pick'" 2 ;;
+	esac
+	# The length is checked before the value: `[` will not compare a twenty-digit string
+	# arithmetically at all — dash answers "Illegal number" and falls through both branches,
+	# leaving the user with a raw shell error instead of a clear refusal.
+	if [ "${#lab_pick}" -gt 9 ] || [ "$lab_pick" -lt 1 ] || [ "$lab_pick" -gt "$lab_i" ]; then
+		die "no session number $lab_pick (there are $lab_i)" 2
+	fi
+
+	# The name came from tmux itself, so it goes past check_name: tmux allows spaces in
+	# names, and a session created by hand inside the container is one the menu is obliged
+	# to open, rather than answering "bad session name" to its own line.
+	lab_attach "$(printf '%s\n' "$lab_names" | sed -n "${lab_pick}p")"
+}
+
+# The number of arguments is remembered before the shift: without that `lab ""` is
+# indistinguishable from a bare `lab` and opens the menu instead of exiting with code 2
+lab_argc=$#
+lab_cmd=${1:-}
+if [ $# -gt 0 ]; then
+	shift
+fi
+
+case $lab_cmd in
+--help | -h)
+	usage
+	exit 0
+	;;
+'')
+	[ "$lab_argc" -eq 0 ] || die_usage "empty command"
+	cmd_menu
+	;;
+ls)
+	[ $# -eq 0 ] || die_usage "ls takes no arguments"
+	cmd_ls
+	;;
+attach)
+	[ $# -eq 1 ] || die_usage "attach needs exactly one session name"
+	cmd_attach "$1"
+	;;
+kill)
+	[ $# -eq 1 ] || die_usage "kill needs exactly one session name"
+	cmd_kill "$1"
+	;;
+run)
+	[ $# -ge 2 ] || die_usage "run needs an agent and a request: lab run <agent> <text>"
+	cmd_run "$@"
+	;;
+-*)
+	die_usage "unknown option: $lab_cmd"
+	;;
+*)
+	# the agent presets come last: their list is shared with `lab run`, so there is no
+	# need to spell out claude|codex|omp here a second time
+	if is_agent "$lab_cmd"; then
+		[ $# -eq 0 ] || die_usage "$lab_cmd takes no arguments"
+		cmd_agent "$lab_cmd"
+	else
+		die_usage "unknown command: $lab_cmd (session names go through 'lab attach')"
+	fi
+	;;
+esac
