@@ -47,6 +47,12 @@ LAB_PI_PROVIDER=ollama
 # PATH can be added; one that needs extra flags is handled in lab_with_agent (see pi).
 LAB_AGENTS=${LAB_AGENTS:-'claude codex omp'}
 
+# Where `lab up` puts uploaded files: every upload gets a fresh directory of its own, so
+# two files with the same name never overwrite each other and trz never has to ask. The
+# default is the exchange directory shared with the host, so the files can be picked up
+# from the host side as well.
+LAB_UPLOAD_DIR=${LAB_UPLOAD_DIR:-/exchange/upload}
+
 # the line format of `lab ls`: the same as tmux's default, but without the creation date
 LAB_LS_FORMAT='#{session_name}: #{session_windows} windows#{?session_attached, (attached),}'
 
@@ -66,12 +72,15 @@ usage:
   lab $(lab_agents_pipe)        attach or create a session running that agent
   lab run <agent> <text>   one-shot request, no tmux, output to stdout
   lab kill <name>          kill a session
+  lab up                   inside tmux: upload files from the client (trzsz) and
+                           type their paths into the active pane, no Enter
   lab --help               this help
 
 session names: letters, digits, "_" and "-", never starting with "-"
                (tmux forbids dots and would read a leading "-" as its own option)
 environment: LAB_PI_MODEL picks the model for pi; omp keeps its own config.yml
              LAB_WORKDIR is where sessions open (default: /workspace)
+             LAB_UPLOAD_DIR is where lab up puts files (default: /exchange/upload)
 exit codes: 0 ok, 1 tmux error (no such session), 2 bad arguments
             run is transparent: it execs the agent and returns the agent's own code
 EOF
@@ -304,6 +313,71 @@ cmd_kill() {
 	lab_exec tmux kill-session -t "=$1"
 }
 
+# A path the way it gets typed into an agent's prompt: as it is when it is made of safe
+# characters only, otherwise in single quotes with every inner quote turned into '\''.
+# The upload directory is ours, but the file names come from the client machine and
+# can hold anything at all.
+lab_quote() {
+	case $1 in
+	'' | *[!A-Za-z0-9_./:@%+=,-]*)
+		printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+		;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+# Upload with trzsz and hand the result to whoever is in the pane: the client's terminal
+# program (tssh, `trzsz ssh`) shows a file dialog, the files land in a fresh directory,
+# and their paths are typed into the active pane without Enter — the user decides what
+# to do with them, exactly like a drop into a local terminal.
+#
+# It is meant to be run from a tmux popup (prefix + U, see tmux/lab.tmux.conf). The pane
+# is looked up here rather than passed in: display-popup in tmux 3.3 does not expand
+# #{pane_id} in its command, while inside the popup the client's active pane is still
+# the one under the popup.
+#
+# trz has to own the terminal of the popup: in tmux it writes its handshake straight to
+# the client's tty, and the client answers through the keyboard of this very popup.
+cmd_up() {
+	[ -n "${TMUX:-}" ] || die "up only works inside a tmux session (prefix + U)" 2
+	lab_pane=$(tmux display-message -p '#{pane_id}') || die "cannot find the active pane"
+	case $lab_pane in
+	%[0-9]*) ;;
+	*) die "unexpected pane id from tmux: '$lab_pane'" ;;
+	esac
+	lab_dir=$LAB_UPLOAD_DIR/$(date +%Y%m%d-%H%M%S)-$$
+	if [ -n "${LAB_DRY_RUN:-}" ]; then
+		lab_cmdline trz "$lab_dir"
+		exit 0
+	fi
+
+	mkdir -p "$lab_dir" || die "cannot create $lab_dir"
+	lab_rc=0
+	trz "$lab_dir" || lab_rc=$?
+	# A failed transfer may leave a half-written file behind: its path is not typed
+	# anywhere, an agent would read it as a whole one. The directory stays for a look.
+	if [ "$lab_rc" -ne 0 ]; then
+		rmdir "$lab_dir" 2>/dev/null || printf 'lab: partial upload kept in %s\n' "$lab_dir" >&2
+		die "trz exited $lab_rc, nothing typed into the pane" "$lab_rc"
+	fi
+
+	lab_paths=
+	# three globs together cover every name, the hidden ones too; one that matched
+	# nothing stays a literal pattern and is dropped by the -e check
+	for lab_f in "$lab_dir"/* "$lab_dir"/.[!.]* "$lab_dir"/..?*; do
+		[ -e "$lab_f" ] || continue
+		lab_paths="$lab_paths$(lab_quote "$lab_f") "
+	done
+	if [ -z "$lab_paths" ]; then
+		# the dialog was cancelled: nothing arrived, nothing to type, no empty directory
+		rmdir "$lab_dir" 2>/dev/null || true
+		exit 0
+	fi
+	# -l: the text is sent literally, so a name that looks like a tmux key (Enter, C-c)
+	# is typed as letters and never becomes a keystroke
+	tmux send-keys -t "$lab_pane" -l -- "$lab_paths" || die "cannot type the paths into $lab_pane"
+}
+
 # The menu with no arguments: a numbered list and a choice by number. The list itself and
 # the prompt go to stderr so that stdout stays clean (under LAB_DRY_RUN it holds only the
 # resulting command).
@@ -376,6 +450,10 @@ attach)
 kill)
 	[ $# -eq 1 ] || die_usage "kill needs exactly one session name"
 	cmd_kill "$1"
+	;;
+up)
+	[ $# -eq 0 ] || die_usage "up takes no arguments"
+	cmd_up
 	;;
 run)
 	[ $# -ge 2 ] || die_usage "run needs an agent and a request: lab run <agent> <text>"

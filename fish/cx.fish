@@ -23,6 +23,10 @@
 # does not affect that division: the transport is chosen by the first word after it.
 #
 # CX_HOST — the ssh alias of the bastion host (bastion by default, defined in ~/.ssh/config).
+# CX_TRANSPORT — what carries sessions: mosh (the default), tssh or ssh. tssh is the
+# trzsz-ssh client in UDP mode (`tssh --udp`, tsshd on the host): it survives roaming and
+# sleep the way mosh does, and unlike mosh it passes the terminal stream through intact,
+# so trz / tsz work inside the sessions. One-shot commands go over ssh whatever is set.
 
 # One-shot commands: they print a line or two and are done, so they go over ssh rather than
 # through mosh. The list is a single one for the file: both the transport choice and the
@@ -49,11 +53,14 @@ usage:
   cx -- --help             help of lab itself, from inside the container
   cx --help                this help
 
-transport: sessions go over mosh when both ends have a terminal, ssh otherwise;
+transport: sessions go over mosh (or tssh, see CX_TRANSPORT) when both ends
+           have a terminal, ssh otherwise;
            one-shot commands always go over ssh, so their exit code survives
            ($cx_oneshot_list); a leading -- does not change
            that (cx -- kill x is still one-shot)
-environment: CX_HOST picks the ssh alias (default: bastion)"
+environment: CX_HOST picks the ssh alias (default: bastion)
+             CX_TRANSPORT picks what carries sessions: mosh (default), tssh, ssh;
+             tssh --udp keeps trzsz working: prefix+U uploads, prefix+D downloads"
 end
 
 function __cx_remote --description 'the command line for the remote shell: lab-host with POSIX quoting'
@@ -114,6 +121,13 @@ function cx --description 'agent sessions on the bastion host: mosh with a fallb
             return 0
     end
 
+    set -l cx_transport mosh
+    test -n "$CX_TRANSPORT"; and set cx_transport $CX_TRANSPORT
+    if not contains -- $cx_transport mosh tssh ssh
+        echo "cx: unknown CX_TRANSPORT '$cx_transport' (mosh, tssh or ssh)" >&2
+        return 2
+    end
+
     # The decision about the transport is taken on the same command that lab will see —
     # that is, already without the leading `--`. The `--` itself does not go anywhere and
     # travels on (lab-host will strip it, exactly one): without this step everything that
@@ -140,7 +154,32 @@ function cx --description 'agent sessions on the bastion host: mosh with a fallb
         set cx_tty 1
     end
 
-    if test $cx_is_oneshot -eq 0; and test $cx_tty -eq 1; and command -q mosh
+    set -l cx_session 0
+    if test $cx_is_oneshot -eq 0; and test $cx_tty -eq 1
+        set cx_session 1
+    end
+
+    if test $cx_session -eq 1; and test $cx_transport = tssh
+        if command -q tssh
+            # tssh parses its options anywhere on the line, even after the host name,
+            # so the remote command travels as one already-quoted string, the same one
+            # ssh gets: as separate words `-c` or `-t` in it would be taken by tssh.
+            # tsshd splits that string into words itself (no shell on the far side),
+            # following the same POSIX quoting rules.
+            tssh --udp -t $cx_host (__cx_remote $argv | string collect -a)
+            set -l cx_rc $status
+            # Unlike mosh, tssh does pass the remote code through, so 1-4 are lab-host's
+            # own verdicts (tmux error, bad arguments, no container, no docker) and a
+            # second try over ssh would only print them twice. tssh's own failures — no
+            # tsshd on the host, the host unreachable — come back as 16 and up.
+            if test $cx_rc -le 4
+                return $cx_rc
+            end
+            echo "cx: tssh exited $cx_rc, falling back to ssh" >&2
+        else
+            echo "cx: CX_TRANSPORT=tssh but tssh is not installed, using ssh" >&2
+        end
+    else if test $cx_session -eq 1; and test $cx_transport = mosh; and command -q mosh
         # the arguments go as a list: the mosh wrapper quotes them itself (shell_quote), so
         # a second helping of quotes here would only break things
         mosh $cx_host -- lab-host $argv

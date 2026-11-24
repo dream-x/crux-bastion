@@ -32,6 +32,8 @@ setup() {
 	# default the function happens to carry; that default gets its own test below.
 	CX_HOST=bastion-host
 	export CX_HOST
+	# the developer's own choice of transport must not leak into the expected commands
+	unset CX_TRANSPORT
 }
 
 # run a piece of fish on top of a loaded cx
@@ -387,4 +389,54 @@ b]" ]
 	run split_remote "$output"
 	[ "$status" -eq 0 ]
 	[ "$output" = "[run][pi][LANG=C]" ]
+}
+
+@test "CX_TRANSPORT=tssh carries a session over tssh --udp, the command as one string" {
+	# tssh takes options from anywhere on its command line, so the remote command has to
+	# be one string — the same one ssh gets, quoting included
+	need_tool script
+	CX_TRANSPORT=tssh run cx_tty "cx attach 'two words'"
+	[ "$status" -eq 0 ]
+	# the stub wraps an argument with spaces in quotes without escaping the inner ones
+	[ "$(stub_log)" = "tssh --udp -t bastion-host 'lab-host attach 'two words''" ]
+}
+
+@test "a lab-host verdict over tssh is passed through, not retried over ssh" {
+	# tssh, unlike mosh, carries the remote exit code: 3 is "no container", and asking
+	# again over ssh would only print the same error twice
+	need_tool script
+	CX_TRANSPORT=tssh STUB_RC=3 run cx_tty 'cx omp'
+	[ "$status" -eq 3 ]
+	[ "$(stub_log)" = "tssh --udp -t bastion-host 'lab-host omp'" ]
+}
+
+@test "a failing tssh client falls back to ssh -t" {
+	# 16 is what tssh returns when it cannot log in or cannot start tsshd
+	need_tool script
+	STUB_RCS=16:0 CX_TRANSPORT=tssh run cx_tty 'cx omp'
+	[ "$status" -eq 0 ]
+	[ "$(stub_log)" = "tssh --udp -t bastion-host 'lab-host omp'
+ssh bastion-host -t 'lab-host omp'" ]
+	[[ "$output" == *"tssh exited 16, falling back to ssh"* ]]
+}
+
+@test "one-shot commands stay on ssh with CX_TRANSPORT=tssh" {
+	need_tool script
+	CX_TRANSPORT=tssh run cx_tty 'cx ls'
+	[ "$status" -eq 0 ]
+	[ "$(stub_log)" = "ssh bastion-host 'lab-host ls'" ]
+}
+
+@test "CX_TRANSPORT=ssh skips mosh even with a tty" {
+	need_tool script
+	CX_TRANSPORT=ssh run cx_tty 'cx omp'
+	[ "$status" -eq 0 ]
+	[ "$(stub_log)" = "ssh bastion-host -t 'lab-host omp'" ]
+}
+
+@test "an unknown CX_TRANSPORT exits 2 and connects nowhere" {
+	CX_TRANSPORT=telnet run --separate-stderr cx_fish 'cx omp' </dev/null
+	[ "$status" -eq 2 ]
+	[[ "$stderr" == *"unknown CX_TRANSPORT 'telnet'"* ]]
+	[ -z "$(stub_log)" ]
 }

@@ -49,10 +49,10 @@ setup() {
 omp -p hi" ]
 }
 
-@test "transport stubs shadow the real mosh and ssh" {
+@test "transport stubs shadow the real mosh, tssh and ssh" {
 	# the most expensive mistake the harness could make: a transport left
 	# unshadowed sends the tests off to the live bastion instead of the log
-	for transport in mosh ssh; do
+	for transport in mosh tssh ssh; do
 		run command -v "$transport"
 		[ "$status" -eq 0 ]
 		[ "$output" = "$STUB_DIR/$transport" ]

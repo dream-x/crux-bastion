@@ -620,3 +620,99 @@ tmux new -As main -c /workspace" ]
 	[[ "$stderr" != *"can't cd"* ]]
 	[ -z "$(stub_log)" ]
 }
+
+# A trz and a tmux of the test's own for `lab up`: trz plays the client by dropping the
+# files named in $LAB_TEST_FILES (one per line) into the directory it was given and then
+# exiting with $LAB_TEST_TRZ_RC; tmux answers display-message with a pane id and writes
+# each argument of send-keys on a line of its own, so the typed text can be compared
+# exactly, spaces and quotes included.
+up_stubs() {
+	mkdir -p "$BATS_TEST_TMPDIR/upbin"
+	cat >"$BATS_TEST_TMPDIR/upbin/trz" <<'STUB'
+#!/bin/sh
+printf 'trz %s\n' "$*" >>"$STUB_LOG"
+if [ -n "${LAB_TEST_FILES:-}" ]; then
+	printf '%s\n' "$LAB_TEST_FILES" | while IFS= read -r f; do
+		printf 'data\n' >"$1/$f"
+	done
+fi
+exit "${LAB_TEST_TRZ_RC:-0}"
+STUB
+	cat >"$BATS_TEST_TMPDIR/upbin/tmux" <<'STUB'
+#!/bin/sh
+case $1 in
+display-message) printf '%%7\n' ;;
+send-keys) printf '%s\n' "$@" >"$STUB_LOG.keys" ;;
+esac
+STUB
+	chmod +x "$BATS_TEST_TMPDIR/upbin/trz" "$BATS_TEST_TMPDIR/upbin/tmux"
+	PATH="$BATS_TEST_TMPDIR/upbin:$PATH"
+	export PATH
+	LAB_UPLOAD_DIR="$BATS_TEST_TMPDIR/upload"
+	export LAB_UPLOAD_DIR
+	TMUX=/tmp/tmux-test,1,0
+	export TMUX
+}
+
+@test "up outside tmux exits 2 and runs nothing" {
+	unset TMUX
+	run --separate-stderr "${LAB_CMD[@]}" up
+	[ "$status" -eq 2 ]
+	[[ "$stderr" == *"only works inside a tmux session"* ]]
+	[ -z "$(stub_log)" ]
+}
+
+@test "up takes no arguments" {
+	run --separate-stderr "${LAB_CMD[@]}" up %3
+	[ "$status" -eq 2 ]
+	[[ "$stderr" == *"up takes no arguments"* ]]
+}
+
+@test "up under LAB_DRY_RUN prints the trz call into a fresh directory" {
+	up_stubs
+	LAB_DRY_RUN=1 run --separate-stderr "${LAB_CMD[@]}" up
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ ^trz\ $LAB_UPLOAD_DIR/[0-9]{8}-[0-9]{6}-[0-9]+$ ]]
+	[ ! -e "$LAB_UPLOAD_DIR" ]
+}
+
+@test "up types the uploaded paths into the pane, quoted, without Enter" {
+	up_stubs
+	LAB_TEST_FILES="plain.txt
+two words.png
+it's
+.hidden" run --separate-stderr "${LAB_CMD[@]}" up
+	[ "$status" -eq 0 ]
+	up_dir=$(ls -d "$LAB_UPLOAD_DIR"/*)
+	# -l: literal text, never a key name; the last argument is the whole line
+	[ "$(sed -n 1,5p "$STUB_LOG.keys")" = "send-keys
+-t
+%7
+-l
+--" ]
+	up_typed=$(sed -n 6p "$STUB_LOG.keys")
+	[[ "$up_typed" == *"$up_dir/plain.txt "* ]]
+	[[ "$up_typed" == *"'$up_dir/two words.png' "* ]]
+	[[ "$up_typed" == *"'$up_dir/it'\\''s' "* ]]
+	[[ "$up_typed" == *"$up_dir/.hidden "* ]]
+	# no Enter and no newline: the user decides what the agent gets
+	[ "$(wc -l <"$STUB_LOG.keys")" -eq 6 ]
+}
+
+@test "a cancelled upload types nothing and leaves no empty directory" {
+	up_stubs
+	run --separate-stderr "${LAB_CMD[@]}" up
+	[ "$status" -eq 0 ]
+	[ ! -e "$STUB_LOG.keys" ]
+	[ -z "$(ls -A "$LAB_UPLOAD_DIR")" ]
+}
+
+@test "a failed upload types nothing, keeps the partial files and passes trz's code" {
+	up_stubs
+	LAB_TEST_FILES=half.bin LAB_TEST_TRZ_RC=5 run --separate-stderr "${LAB_CMD[@]}" up
+	[ "$status" -eq 5 ]
+	[ ! -e "$STUB_LOG.keys" ]
+	[[ "$stderr" == *"partial upload kept in $LAB_UPLOAD_DIR/"* ]]
+	[[ "$stderr" == *"trz exited 5, nothing typed into the pane"* ]]
+	[ -e "$(ls -d "$LAB_UPLOAD_DIR"/*)/half.bin" ]
+}
